@@ -117,8 +117,8 @@ use datafusion_proto::bytes::{
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr_with_converter;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
-    AsExecutionPlan, DeduplicatingProtoConverter, DefaultPhysicalExtensionCodec,
-    DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
+    AsExecutionPlan, ComposedPhysicalExtensionCodec, DeduplicatingProtoConverter,
+    DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
     PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf;
@@ -1192,6 +1192,144 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
         exec_plan,
         &ctx,
         &CustomPhysicalExtensionCodec {},
+        &DefaultPhysicalProtoConverter {},
+    )?;
+    Ok(())
+}
+
+/// A [ComposedPhysicalExtensionCodec] must forward `try_encode_expr`/`try_decode_expr` to its
+/// inner codecs, exactly as it already does for `try_encode`/`try_decode` and the UDF/UDAF
+/// methods -- otherwise a codec that only handles unrecognized exprs (not exec plan nodes) is
+/// silently unreachable when composed with others.
+#[test]
+fn roundtrip_composed_codec_forwards_expr_calls() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+
+    #[derive(Debug, Clone, Eq)]
+    struct CustomExpr {
+        inner: Arc<dyn PhysicalExpr>,
+    }
+
+    // Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
+    impl PartialEq for CustomExpr {
+        fn eq(&self, other: &Self) -> bool {
+            self.inner.eq(&other.inner)
+        }
+    }
+
+    impl std::hash::Hash for CustomExpr {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.inner.hash(state);
+        }
+    }
+
+    impl Display for CustomExpr {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CustomExpr({})", self.inner)
+        }
+    }
+
+    impl PhysicalExpr for CustomExpr {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
+            self.inner.data_type(input_schema)
+        }
+
+        fn nullable(&self, input_schema: &Schema) -> Result<bool> {
+            self.inner.nullable(input_schema)
+        }
+
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+            self.inner.evaluate(batch)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            Ok(Arc::new(CustomExpr {
+                inner: children.remove(0),
+            }))
+        }
+
+        fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self, f)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CustomExprCodec;
+    impl PhysicalExtensionCodec for CustomExprCodec {
+        fn try_decode(
+            &self,
+            _buf: &[u8],
+            _inputs: &[Arc<dyn ExecutionPlan>],
+            _ctx: &TaskContext,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            internal_err!("not an exec plan codec")
+        }
+
+        fn try_encode(
+            &self,
+            _node: Arc<dyn ExecutionPlan>,
+            _buf: &mut Vec<u8>,
+        ) -> Result<()> {
+            internal_err!("not an exec plan codec")
+        }
+
+        fn try_decode_expr(
+            &self,
+            buf: &[u8],
+            inputs: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            if buf == b"CustomExpr" {
+                Ok(Arc::new(CustomExpr {
+                    inner: Arc::clone(&inputs[0]),
+                }))
+            } else {
+                internal_err!("Not supported")
+            }
+        }
+
+        fn try_encode_expr(
+            &self,
+            node: &Arc<dyn PhysicalExpr>,
+            buf: &mut Vec<u8>,
+        ) -> Result<()> {
+            if node.as_any().downcast_ref::<CustomExpr>().is_some() {
+                buf.extend_from_slice(b"CustomExpr");
+                Ok(())
+            } else {
+                internal_err!("Not supported")
+            }
+        }
+    }
+
+    let expr = Arc::new(CustomExpr {
+        inner: col("a", &schema)?,
+    });
+    let plan = ProjectionExec::try_new(
+        vec![ProjectionExpr {
+            expr,
+            alias: "a".to_string(),
+        }],
+        input,
+    )?;
+
+    let ctx = SessionContext::new();
+    let codec = ComposedPhysicalExtensionCodec::new(vec![Arc::new(CustomExprCodec)]);
+    roundtrip_test_and_return(
+        Arc::new(plan),
+        &ctx,
+        &codec,
         &DefaultPhysicalProtoConverter {},
     )?;
     Ok(())

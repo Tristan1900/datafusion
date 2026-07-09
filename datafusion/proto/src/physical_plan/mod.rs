@@ -4129,6 +4129,22 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
     fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {
         self.encode_protobuf(buf, |codec, data| codec.try_encode_udaf(node, data))
     }
+
+    fn try_decode_expr(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn PhysicalExpr>],
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.decode_protobuf(buf, |codec, data| codec.try_decode_expr(data, inputs))
+    }
+
+    fn try_encode_expr(
+        &self,
+        node: &Arc<dyn PhysicalExpr>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.encode_protobuf(buf, |codec, data| codec.try_encode_expr(node, data))
+    }
 }
 
 fn into_physical_plan(
